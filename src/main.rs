@@ -72,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+
 async fn health_check() -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
