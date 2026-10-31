@@ -13,6 +13,8 @@ pub struct KnowledgeBase {
 }
 
 impl KnowledgeBase {
+    /// Dynamically loads all .md files from any given directory.
+    /// Works with ANY project simply by changing or adding .md files!
     pub fn load_from_dir<P: AsRef<Path>>(dir_path: P) -> Self {
         let mut pages = Vec::new();
         let path = dir_path.as_ref();
@@ -49,118 +51,85 @@ impl KnowledgeBase {
         Self { pages }
     }
 
+    /// Generic, TF-IDF inspired full-text search with dynamic weighting.
+    /// Zero hardcoded page names! Matches ANY project's markdown documents automatically.
     pub fn search(&self, query: &str, limit: usize) -> Vec<PageDoc> {
         if self.pages.is_empty() {
             return Vec::new();
         }
 
-        let query_lower = query.to_lowercase();
-        let words: Vec<String> = query_lower
+        let query_clean: String = query
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+            .collect();
+
+        let words: Vec<String> = query_clean
             .split_whitespace()
-            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
-            .filter(|w| w.len() > 2)
+            .filter(|w| w.len() > 1)
+            .map(|w| w.to_string())
             .collect();
 
         let mut scored: Vec<(usize, &PageDoc)> = self
             .pages
             .iter()
             .map(|page| {
-                let fname = page.filename.to_lowercase();
+                let fname_lower = page.filename.to_lowercase();
                 let title_lower = page.title.to_lowercase();
-                let hay = format!("{} {}", page.title, page.content).to_lowercase();
-                let mut score = 0;
+                let body_lower = page.content.to_lowercase();
 
-                // Priority keywords mapping
-                if (query_lower.contains("team")
-                    || query_lower.contains("member")
-                    || query_lower.contains("leader")
-                    || query_lower.contains("who work")
-                    || query_lower.contains("name"))
-                    && fname == "team"
-                {
-                    score += 150;
-                }
+                let mut score: usize = 0;
 
-                if (query_lower.contains("course")
-                    || query_lower.contains("learn")
-                    || query_lower.contains("training")
-                    || query_lower.contains("class")
-                    || query_lower.contains("study")
-                    || query_lower.contains("provide"))
-                    && (fname == "courses" || fname == "services")
-                {
-                    if fname == "courses" {
-                        score += 150;
-                    } else {
-                        score += 40;
+                // 1. Exact phrase matches in Title or Filename (Highest relevancy)
+                if !query_clean.is_empty() {
+                    if title_lower.contains(&query_clean) {
+                        score += 80;
+                    }
+                    if fname_lower.contains(&query_clean) {
+                        score += 90;
                     }
                 }
 
-                if (query_lower.contains("contact")
-                    || query_lower.contains("phone")
-                    || query_lower.contains("call")
-                    || query_lower.contains("number")
-                    || query_lower.contains("email")
-                    || query_lower.contains("location")
-                    || query_lower.contains("office")
-                    || query_lower.contains("address"))
-                    && (fname == "contact" || fname == "home")
-                {
-                    if fname == "contact" {
-                        score += 150;
-                    } else {
-                        score += 50;
-                    }
-                }
-
-                if (query_lower.contains("service")
-                    || query_lower.contains("offer")
-                    || query_lower.contains("what do you do")
-                    || query_lower.contains("develop"))
-                    && fname == "services"
-                {
-                    score += 150;
-                }
-
-                if (query_lower.contains("career")
-                    || query_lower.contains("job")
-                    || query_lower.contains("hiring")
-                    || query_lower.contains("apply"))
-                    && fname == "careers"
-                {
-                    score += 150;
-                }
-
-                if (query_lower.contains("portfolio")
-                    || query_lower.contains("project")
-                    || query_lower.contains("case study")
-                    || query_lower.contains("work"))
-                    && fname == "portfolio"
-                {
-                    score += 150;
-                }
-
+                // 2. Individual word relevancy scoring
                 for w in &words {
-                    if fname.contains(w) {
-                        score += 30;
+                    // Filename exact or prefix match (Strongest signal)
+                    if fname_lower == *w {
+                        score += 70;
+                    } else if fname_lower.contains(w) {
+                        score += 35;
                     }
+
+                    // Title word match
                     if title_lower.contains(w) {
-                        score += 20;
+                        score += 25;
                     }
-                    let count = hay.matches(w.as_str()).count();
-                    score += count.min(15);
+
+                    // Content frequency occurrences (capped to avoid noise)
+                    let count = body_lower.matches(w.as_str()).count();
+                    score += count.min(15) * 3;
                 }
 
                 (score, page)
             })
             .collect();
 
+        // Sort descending by calculated relevance score
         scored.sort_by(|a, b| b.0.cmp(&a.0));
 
-        scored
+        // If top scored has positive score, return top matches
+        let results: Vec<PageDoc> = scored
             .into_iter()
+            .filter(|(s, _)| *s > 0)
             .take(limit)
             .map(|(_, p)| p.clone())
-            .collect()
+            .collect();
+
+        // Fallback: If no specific word matched (e.g. general query like "hi" or "help"),
+        // return the first available pages so the AI still has context to assist
+        if results.is_empty() {
+            self.pages.iter().take(limit).cloned().collect()
+        } else {
+            results
+        }
     }
 }
