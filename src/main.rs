@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Clone)]
-struct AppState {
+struct AppState { 
     gemini_client: gemini::Client,
     model_name: String,
     project_name: String,
@@ -264,7 +264,7 @@ async fn lead_handler(
     }
     println!("Message: {}", message);
     println!("=======================================================\n");
-    
+
     // 1. Persist lead to disk in JSON Lines format so it is never lost
     let _ = std::fs::create_dir_all("data");
     let lead_record = json!({
