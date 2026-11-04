@@ -263,7 +263,6 @@ async fn lead_handler(
     }
     println!("Message: {}", message);
     println!("=======================================================\n");
-
     // 1. Persist lead to disk in JSON Lines format so it is never lost
     let _ = std::fs::create_dir_all("data");
     let lead_record = serde_json::json!({
