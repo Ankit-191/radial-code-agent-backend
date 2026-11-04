@@ -1,4 +1,5 @@
-FROM rust:latest AS builder
+# Use rust:bookworm to match the exact GLIBC version of debian:bookworm-slim
+FROM rust:bookworm AS builder
 RUN apt-get update && apt-get install -y pkg-config libssl-dev cmake build-essential && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
