@@ -15,6 +15,7 @@ use lettre::{AsyncSmtpTransport, AsyncTransport, Message as LettreMessage, Tokio
 use rig::completion::Prompt;
 use rig::providers::gemini;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::env;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -266,16 +267,16 @@ async fn lead_handler(
     
     // 1. Persist lead to disk in JSON Lines format so it is never lost
     let _ = std::fs::create_dir_all("data");
-    let lead_record = serde_json::json!({
+    let lead_record = json!({
         "timestamp": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
-        "project": state.project_name,
-        "name": name,
-        "email": email,
-        "phone": phone,
-        "message": message,
+        "project": &state.project_name,
+        "name": &name,
+        "email": &email,
+        "phone": &phone,
+        "message": &message,
     });
 
     if let Ok(mut file) = std::fs::OpenOptions::new()
