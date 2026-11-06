@@ -1,7 +1,7 @@
 mod knowledge;
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -16,26 +16,47 @@ use rig::completion::Prompt;
 use rig::providers::gemini;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use std::env;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Clone)]
-struct AppState { 
+struct AppState {
     gemini_client: gemini::Client,
     model_name: String,
     project_name: String,
     knowledge_base: Arc<KnowledgeBase>,
+    db_pool: Option<PgPool>,
 }
 
 #[derive(Deserialize)]
 struct ChatRequest {
     question: String,
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Serialize)]
 struct ChatResponse {
     answer: String,
+}
+
+#[derive(Deserialize)]
+struct HistoryParams {
+    session_id: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct StoredChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Serialize)]
+struct HistoryResponse {
+    messages: Vec<StoredChatMessage>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -53,6 +74,43 @@ struct LeadResponse {
     message: String,
 }
 
+async fn init_database(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS leads (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            email VARCHAR(255) NOT NULL,
+            phone VARCHAR(50),
+            message TEXT NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id SERIAL PRIMARY KEY,
+            session_id VARCHAR(100) NOT NULL,
+            role VARCHAR(20) NOT NULL,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_chat_session ON chat_messages(session_id);")
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
@@ -67,13 +125,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("AI Model: {}", model_name);
     println!("Knowledge Directory: {}", knowledge_dir);
 
-    // Check SMTP status on startup
+    // 1. Initialize PostgreSQL Connection Pool if configured
+    let db_pool = match env::var("DATABASE_URL") {
+        Ok(url) if !url.trim().is_empty() => {
+            println!("Connecting to PostgreSQL database (Neon)...");
+            match PgPoolOptions::new()
+                .max_connections(10)
+                .acquire_timeout(std::time::Duration::from_secs(6))
+                .connect(&url)
+                .await
+            {
+                Ok(pool) => {
+                    if let Err(err) = init_database(&pool).await {
+                        eprintln!("⚠️ Database schema migration error: {}", err);
+                    } else {
+                        println!("✅ Neon PostgreSQL connected & schema verified!");
+                    }
+                    Some(pool)
+                }
+                Err(err) => {
+                    eprintln!("⚠️ Database connection warning: {}. Operating in offline fallback mode.", err);
+                    None
+                }
+            }
+        }
+        _ => {
+            println!("ℹ️ DATABASE_URL not set in .env. Operating in local fallback mode (leads to disk).");
+            None
+        }
+    };
+
+    // 2. Check SMTP status on startup
     if let Ok(smtp_email) = env::var("SMTP_EMAIL") {
         if !smtp_email.trim().is_empty() {
             println!("Email Dispatcher: Configured via Gmail SMTP ({})", smtp_email.trim());
         }
     } else {
-        println!("Email Dispatcher: Not configured yet (leads will be saved to disk)");
+        println!("Email Dispatcher: Not configured yet (leads will be saved to disk / DB)");
     }
 
     let knowledge_path = std::path::Path::new(&knowledge_dir);
@@ -84,6 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model_name,
         project_name,
         knowledge_base,
+        db_pool,
     };
 
     let cors = CorsLayer::new()
@@ -94,6 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/chat", post(chat_handler))
+        .route("/chat/history", get(chat_history_handler))
         .route("/lead", post(lead_handler))
         .layer(cors)
         .with_state(state);
@@ -107,13 +197,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn health_check() -> impl IntoResponse {
+async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     let project_name = env::var("PROJECT_NAME").unwrap_or_else(|_| "RadialCode".to_string());
     let smtp_configured = env::var("SMTP_EMAIL").map(|s| !s.trim().is_empty()).unwrap_or(false);
     Json(serde_json::json!({
         "status": "ok",
         "project": project_name,
         "service": "universal-knowledge-agent",
+        "database": if state.db_pool.is_some() { "connected (Neon PostgreSQL)" } else { "unconfigured / fallback" },
         "email_service": if smtp_configured { "active" } else { "unconfigured" }
     }))
 }
@@ -288,7 +379,32 @@ async fn lead_handler(
         let _ = writeln!(file, "{}", lead_record);
     }
 
-    // 2. Dispatch email notification in background via Gmail SMTP
+    // 2. Persist lead to Neon PostgreSQL database if connected
+    if let Some(ref pool) = state.db_pool {
+        let pool_clone = pool.clone();
+        let name_c = name.clone();
+        let email_c = email.clone();
+        let phone_c = phone.clone();
+        let msg_c = message.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sqlx::query(
+                "INSERT INTO leads (name, email, phone, message) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(&name_c)
+            .bind(&email_c)
+            .bind(&phone_c)
+            .bind(&msg_c)
+            .execute(&pool_clone)
+            .await
+            {
+                eprintln!("⚠️ Failed to save lead to Neon PostgreSQL: {}", e);
+            } else {
+                println!("✅ Lead successfully persisted to Neon PostgreSQL database!");
+            }
+        });
+    }
+
+    // 3. Dispatch email notification in background via Gmail SMTP
     let project_name = state.project_name.clone();
     let name_clone = name.clone();
     let email_clone = email.clone();
@@ -393,5 +509,65 @@ async fn chat_handler(
         }
     }
 
+    // 3. Persist conversation turn to Neon PostgreSQL if connected
+    if let Some(ref pool) = state.db_pool {
+        if let Some(ref sid) = payload.session_id {
+            let pool_clone = pool.clone();
+            let sid_c = sid.clone();
+            let q_c = question.to_string();
+            let a_c = answer.clone();
+            tokio::spawn(async move {
+                let _ = sqlx::query(
+                    "INSERT INTO chat_messages (session_id, role, content) VALUES ($1, $2, $3), ($1, $4, $5)",
+                )
+                .bind(&sid_c)
+                .bind("user")
+                .bind(&q_c)
+                .bind("assistant")
+                .bind(&a_c)
+                .execute(&pool_clone)
+                .await;
+            });
+        }
+    }
+
     Ok(Json(ChatResponse { answer }))
+}
+
+async fn chat_history_handler(
+    State(state): State<AppState>,
+    Query(params): Query<HistoryParams>,
+) -> Json<HistoryResponse> {
+    let session_id = params.session_id.trim();
+    if session_id.is_empty() {
+        return Json(HistoryResponse { messages: Vec::new() });
+    }
+
+    if let Some(ref pool) = state.db_pool {
+        match sqlx::query(
+            "SELECT role, content FROM chat_messages WHERE session_id = $1 ORDER BY id ASC",
+        )
+        .bind(session_id)
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => {
+                use sqlx::Row;
+                let messages = rows
+                    .into_iter()
+                    .map(|row| StoredChatMessage {
+                        role: row.try_get("role").unwrap_or_else(|_| "assistant".to_string()),
+                        content: row.try_get("content").unwrap_or_default(),
+                    })
+                    .collect();
+                Json(HistoryResponse { messages })
+            }
+            Err(e) => {
+                eprintln!("⚠️ Failed to fetch chat history from Neon: {}", e);
+                Json(HistoryResponse { messages: Vec::new() })
+            }
+        }
+    } else {
+        Json(HistoryResponse { messages: Vec::new() })
+    }
 }
